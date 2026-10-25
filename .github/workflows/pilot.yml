@@ -1,0 +1,188 @@
+name: Single mobile Lighthouse artifact pilot
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: single-lighthouse-pilot
+  cancel-in-progress: false
+jobs:
+  pilot:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare exact configuration and tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          npm install --no-audit --no-fund --save-exact lighthouse@13.5.0
+          test "$(node -p "require('./node_modules/lighthouse/package.json').version")" = '13.5.0'
+          cp package-lock.json results/package-lock.json
+          export CHROME_PATH="$(command -v google-chrome)"
+          test -n "$CHROME_PATH"
+          echo "CHROME_PATH=$CHROME_PATH" >> "$GITHUB_ENV"
+          "$CHROME_PATH" --version > results/chrome-version.txt
+          node --version > results/node-version.txt
+          uname -a > results/uname.txt
+          lscpu > results/lscpu.txt
+          free -b > results/memory.txt
+          df -h /dev/shm > results/shared-memory.txt
+          cat /etc/os-release > results/os-release.txt
+          cat /proc/loadavg > results/load-before.txt
+          printf '%s\n' "ImageOS=${ImageOS:-}" "ImageVersion=${ImageVersion:-}" "RUNNER_OS=$RUNNER_OS" "RUNNER_ARCH=$RUNNER_ARCH" "RUNNER_NAME=$RUNNER_NAME" "GITHUB_RUN_ID=$GITHUB_RUN_ID" "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" > results/runner.txt
+          cat > config.json <<'CONFIG'
+          {
+            "extends": "lighthouse:default",
+            "settings": {
+              "onlyCategories": [
+                "performance"
+              ],
+              "formFactor": "mobile",
+              "locale": "en-US",
+              "throttlingMethod": "simulate",
+              "throttling": {
+                "rttMs": 150,
+                "throughputKbps": 1638.4,
+                "requestLatencyMs": 562.5,
+                "downloadThroughputKbps": 1474.56,
+                "uploadThroughputKbps": 675,
+                "cpuSlowdownMultiplier": 1.2
+              },
+              "screenEmulation": {
+                "mobile": true,
+                "width": 412,
+                "height": 823,
+                "deviceScaleFactor": 1.75,
+                "disabled": false
+              },
+              "disableStorageReset": false,
+              "disableFullPageScreenshot": true,
+              "maxWaitForFcp": 15000,
+              "maxWaitForLoad": 35000,
+              "additionalTraceCategories": [
+                "toplevel",
+                "cc",
+                "viz",
+                "gpu",
+                "benchmark",
+                "renderer.scheduler",
+                "disabled-by-default-cc.debug",
+                "disabled-by-default-gpu.service",
+                "disabled-by-default-v8.cpu_profiler"
+              ]
+            }
+          }
+          CONFIG
+          cp config.json results/config.json
+          node --input-type=module <<'CATEGORIES'
+          import fs from 'node:fs';
+          import Trace from './node_modules/lighthouse/core/gather/gatherers/trace.js';
+          const config=JSON.parse(fs.readFileSync('config.json','utf8'));
+          fs.writeFileSync('results/trace-categories.json',JSON.stringify([...new Set([...Trace.getDefaultTraceCategories(),...config.settings.additionalTraceCategories])],null,2));
+          CATEGORIES
+      - name: ONE navigation - never retry automatically
+        id: navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          date -u +%FT%TZ > results/start-utc.txt
+          ./node_modules/.bin/lighthouse 'https://remont-holodilnikov.kz/remont-xolodilnikov-na-domu-v-g-almaty' --config-path=./config.json --chrome-flags='--headless' --output=json --output-path=./results/report.json --save-assets --no-enable-error-reporting 2>&1 | tee results/lighthouse.log
+          date -u +%FT%TZ > results/end-utc.txt
+          cat /proc/loadavg > results/load-after.txt
+      - name: Check files and event coverage without loading the site
+        if: always() && steps.navigation.outcome == 'success'
+        shell: bash
+        run: |
+          cat > validate.py <<'VALIDATOR'
+          """Validate saved artifacts; never opens the site or launches a browser."""
+          import collections
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import shutil
+          
+          out = pathlib.Path('results')
+          reports = list(out.glob('report.json'))
+          traces = list(out.glob('*.trace.json'))
+          logs = list(out.glob('*.devtoolslog.json'))
+          if len(reports) != 1 or len(traces) != 1 or len(logs) != 1:
+              raise SystemExit('Expected exactly one report, trace, and devtoolslog; no rerun will occur.')
+          shutil.copyfile(traces[0], out/'trace.json')
+          shutil.copyfile(logs[0], out/'devtoolslog.json')
+          report = json.loads(reports[0].read_text())
+          trace = json.loads((out/'trace.json').read_text())
+          log = json.loads((out/'devtoolslog.json').read_text())
+          events = trace['traceEvents']
+          names = collections.Counter(e.get('name','') for e in events)
+          methods = collections.Counter(e.get('method','') for e in log)
+          patterns = {
+              'lcp_candidate': r'largestContentfulPaint::Candidate|LargestContentfulPaint::Candidate',
+              'run_task': r'RunTask|ThreadControllerImpl::RunTask|ThreadPool_RunTask',
+              'js_sampling': r'^Profile$|^ProfileChunk$|^CpuProfile$',
+              'resource_send': r'^ResourceSendRequest$',
+              'resource_response': r'^ResourceReceiveResponse$',
+              'resource_finish': r'^ResourceFinish$',
+              'style': r'UpdateLayoutTree|RecalculateStyles|RecalcStyle',
+              'layout': r'^Layout$',
+              'paint': r'^Paint$',
+              'begin_frame': r'BeginFrame|BeginMainFrame',
+              'raster': r'RasterTask|RasterBuffer|Rasterize',
+              'commit': r'Commit|commit',
+              'activation': r'ActivateLayerTree|Activation|ActivateSyncTree',
+              'presentation': r'Presentation|Presented|SwapBuffers|Display::DrawAndSwap',
+          }
+          groups = {k:{n:c for n,c in names.items() if re.search(p,n)} for k,p in patterns.items()}
+          metrics = report.get('audits',{}).get('metrics',{}).get('details',{}).get('items',[{}])[0]
+          nav_ts = metrics.get('observedNavigationStartTs')
+          navs = [e for e in events if e.get('name') == 'navigationStart']
+          matching_navs = [e for e in navs if nav_ts is not None and abs(e['ts']-nav_ts) <= 1000]
+          documents = [e.get('params',{}) for e in log if e.get('method') == 'Network.requestWillBeSent' and e.get('params',{}).get('type') == 'Document']
+          target_documents = [e for e in documents if e.get('request',{}).get('url') == report.get('requestedUrl')]
+          samples = sum(len(e.get('args',{}).get('data',{}).get('cpuProfile',{}).get('samples',[])) for e in events if e.get('name') == 'ProfileChunk')
+          thread_names = [{'pid':e.get('pid'),'tid':e.get('tid'),'name':e.get('args',{}).get('name')} for e in events if e.get('name') == 'thread_name']
+          core = ['lcp_candidate','run_task','js_sampling','resource_send','resource_response','resource_finish','layout','paint']
+          checks = {
+              'lighthouse_13_5_0': report.get('lighthouseVersion') == '13.5.0',
+              'one_target_document_request': len(target_documents) == 1,
+              'report_navigation_timestamp_found_in_trace': bool(matching_navs),
+              'devtools_has_network_response': methods['Network.responseReceived'] > 0,
+              'devtools_has_network_finish': methods['Network.loadingFinished'] > 0,
+              'nonempty_js_samples': samples > 0,
+              **{k:bool(groups[k]) for k in core},
+          }
+          hashes = {n:hashlib.sha256((out/n).read_bytes()).hexdigest() for n in ['report.json','trace.json','devtoolslog.json']}
+          result = {'checks':checks,'core_pass':all(checks.values()),'event_groups':groups,
+              'profile_samples':samples,'trace_events':len(events),'cdp_methods':dict(methods),
+              'matching_navigation_events':matching_navs,'document_requests':documents,
+              'thread_names':thread_names,'metrics':metrics,'environment':report.get('environment'),
+              'configSettings':report.get('configSettings'),'fetchTime':report.get('fetchTime'),
+              'runWarnings':report.get('runWarnings'),'runtimeError':report.get('runtimeError'),
+              'sha256':hashes,
+              'limitations':'Event-name presence alone does not prove a full frame flow or actual hardware display presentation. Inspect pid/tid, flow IDs, timings and sample stacks. This is a headless Linux VM.'}
+          (out/'validation.json').write_text(json.dumps(result,indent=2))
+          (out/'event-counts.json').write_text(json.dumps(dict(names),indent=2))
+          lines=['# Single-navigation pilot artifact check','',f"Core checks pass: {result['core_pass']}",'', '| Event group | Events |','|---|---:|']
+          lines += [f'| {k} | {sum(v.values())} |' for k,v in groups.items()]
+          lines += ['',f'JS samples: {samples}',f'Trace events: {len(events)}','',result['limitations']]
+          (out/'validation.md').write_text('\n'.join(lines))
+          print('\n'.join(lines))
+          if not result['core_pass']:
+              raise SystemExit('Required artifact checks failed. Do not start a series.')
+          VALIDATOR
+          python3 validate.py
+      - name: Preserve one-navigation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-single-pilot-${{ github.run_id }}
+          path: results/
+          retention-days: 3
+          compression-level: 9
+          if-no-files-found: error
