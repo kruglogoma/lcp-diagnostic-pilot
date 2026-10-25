@@ -1,0 +1,298 @@
+name: Scheduler and Lighthouse paired capture
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: scheduler-lighthouse-capture
+  cancel-in-progress: false
+jobs:
+  pilot:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare exact configuration and tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          npm install --no-audit --no-fund --save-exact lighthouse@13.5.0
+          test "$(node -p "require('./node_modules/lighthouse/package.json').version")" = '13.5.0'
+          cp package-lock.json results/package-lock.json
+          export CHROME_PATH="$(command -v google-chrome)"
+          test -n "$CHROME_PATH"
+          echo "CHROME_PATH=$CHROME_PATH" >> "$GITHUB_ENV"
+          "$CHROME_PATH" --version > results/chrome-version.txt
+          node --version > results/node-version.txt
+          uname -a > results/uname.txt
+          lscpu > results/lscpu.txt
+          free -b > results/memory.txt
+          df -h /dev/shm > results/shared-memory.txt
+          cat /etc/os-release > results/os-release.txt
+          cat /proc/loadavg > results/load-before.txt
+          printf '%s\n' "ImageOS=${ImageOS:-}" "ImageVersion=${ImageVersion:-}" "RUNNER_OS=$RUNNER_OS" "RUNNER_ARCH=$RUNNER_ARCH" "RUNNER_NAME=$RUNNER_NAME" "GITHUB_RUN_ID=$GITHUB_RUN_ID" "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" > results/runner.txt
+          cat > config.json <<'CONFIG'
+          {
+            "extends": "lighthouse:default",
+            "settings": {
+              "onlyCategories": [
+                "performance"
+              ],
+              "formFactor": "mobile",
+              "locale": "en-US",
+              "throttlingMethod": "simulate",
+              "throttling": {
+                "rttMs": 150,
+                "throughputKbps": 1638.4,
+                "requestLatencyMs": 562.5,
+                "downloadThroughputKbps": 1474.56,
+                "uploadThroughputKbps": 675,
+                "cpuSlowdownMultiplier": 1.2
+              },
+              "screenEmulation": {
+                "mobile": true,
+                "width": 412,
+                "height": 823,
+                "deviceScaleFactor": 1.75,
+                "disabled": false
+              },
+              "disableStorageReset": false,
+              "disableFullPageScreenshot": true,
+              "maxWaitForFcp": 15000,
+              "maxWaitForLoad": 35000,
+              "additionalTraceCategories": [
+                "toplevel",
+                "cc",
+                "viz",
+                "gpu",
+                "benchmark",
+                "renderer.scheduler",
+                "disabled-by-default-cc.debug",
+                "disabled-by-default-gpu.service",
+                "disabled-by-default-v8.cpu_profiler"
+              ]
+            }
+          }
+          CONFIG
+          cp config.json results/config.json
+          node --input-type=module <<'CATEGORIES'
+          import fs from 'node:fs';
+          import Trace from './node_modules/lighthouse/core/gather/gatherers/trace.js';
+          const config=JSON.parse(fs.readFileSync('config.json','utf8'));
+          fs.writeFileSync('results/trace-categories.json',JSON.stringify([...new Set([...Trace.getDefaultTraceCategories(),...config.settings.additionalTraceCategories])],null,2));
+          CATEGORIES
+      - name: Preflight scheduler then at most TWO navigations
+        id: navigation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > capture.py <<'CAPTURE'
+          """Two navigations only after a real, successful scheduler recording preflight."""
+          import glob
+          import json
+          import os
+          import pathlib
+          import shutil
+          import signal
+          import subprocess
+          import threading
+          import time
+          
+          ROOT = pathlib.Path('results')
+          EVENTS = ['-e', 'sched:sched_switch', '-e', 'sched:sched_wakeup', '-e', 'sched:sched_wakeup_new']
+          def stamp():
+              return {'utc_ns': time.time_ns(), 'monotonic_ns': time.monotonic_ns(), 'boottime_ns': time.clock_gettime_ns(time.CLOCK_BOOTTIME)}
+          def read(path):
+              try: return pathlib.Path(path).read_text()
+              except (OSError, PermissionError): return None
+          def run(args, **kw):
+              return subprocess.run(args, check=True, **kw)
+          
+          # Do not install packages, change sysctls, or relax perf/tracefs security settings.
+          candidates = [shutil.which('perf')] + glob.glob('/usr/lib/linux-tools/*/perf')
+          perf = None
+          for candidate in dict.fromkeys(x for x in candidates if x):
+              probe = subprocess.run([candidate, '--version'], capture_output=True, text=True)
+              if probe.returncode == 0:
+                  perf = candidate
+                  (ROOT/'perf-version.txt').write_text(probe.stdout + probe.stderr)
+                  break
+          if not perf:
+              raise SystemExit('PREFLIGHT FAILED: no working perf binary. ZERO target navigations.')
+          pre = ROOT/'scheduler-preflight'
+          pre.mkdir()
+          (pre/'clock-before.json').write_text(json.dumps(stamp()))
+          with (pre/'record.log').open('w') as f:
+              run(['sudo','-n',perf,'record','-a','--clockid','mono','-o',str(pre/'perf.data'),*EVENTS,'--','sleep','0.5'],stdout=f,stderr=subprocess.STDOUT,timeout=20)
+          with (pre/'events.txt').open('w') as f:
+              run(['sudo','-n',perf,'script','--ns','-i',str(pre/'perf.data')],stdout=f,stderr=subprocess.STDOUT,timeout=20)
+          run(['sudo','-n','chown',str(os.getuid())+':'+str(os.getgid()),str(pre/'perf.data')])
+          data = (pre/'events.txt').read_text()
+          if 'sched_switch:' not in data or 'sched_wakeup:' not in data:
+              raise SystemExit('PREFLIGHT FAILED: scheduler events absent. ZERO target navigations.')
+          (pre/'clock-after.json').write_text(json.dumps(stamp()))
+          (pre/'status.txt').write_text('PASS. Kernel scheduling events recorded before any target navigation.\n')
+          print('PREFLIGHT PASS: actual sched_switch and sched_wakeup events', flush=True)
+          
+          def observe(dest, stop):
+              startcpu = time.thread_time_ns()
+              with (dest/'telemetry.jsonl').open('w') as f:
+                  while not stop.is_set():
+                      sample = {**stamp(), 'proc_stat':read('/proc/stat'), 'pressure_cpu':read('/proc/pressure/cpu'), 'loadavg':read('/proc/loadavg'), 'processes':[]}
+                      groups = {'/sys/fs/cgroup'}
+                      for entry in pathlib.Path('/proc').iterdir():
+                          if not entry.name.isdigit(): continue
+                          comm = read(entry/'comm')
+                          if not comm or not any(x in comm.lower() for x in ['chrome','chromium']): continue
+                          cg = read(entry/'cgroup')
+                          proc = {'pid':int(entry.name),'comm':comm.strip(),'cgroup':cg,'status':read(entry/'status'),'threads':[]}
+                          if cg:
+                              for line in cg.splitlines():
+                                  if line.startswith('0::'):
+                                      target = pathlib.Path('/sys/fs/cgroup')/line[3:].lstrip('/')
+                                      if '..' not in target.parts:
+                                          groups.add(str(target))
+                          try:
+                              for task in (entry/'task').iterdir():
+                                  proc['threads'].append({'tid':int(task.name),'comm':read(task/'comm'),'stat':read(task/'stat'),'schedstat':read(task/'schedstat'),'wchan':read(task/'wchan')})
+                          except OSError: pass
+                          sample['processes'].append(proc)
+                      sample['cgroups'] = {g:{x:read(pathlib.Path(g)/x) for x in ['cpu.stat','cpu.max','cpu.pressure']} for g in groups}
+                      f.write(json.dumps(sample)+'\n'); f.flush()
+                      stop.wait(0.1)
+              (dest/'observer-cost.json').write_text(json.dumps({'thread_cpu_ns':time.thread_time_ns()-startcpu}))
+          
+          for index in ['01','02']:
+              dest = ROOT/('run-'+index)
+              dest.mkdir()
+              stop = threading.Event()
+              observer = threading.Thread(target=observe,args=(dest,stop))
+              recorder = None
+              (dest/'clock-before.json').write_text(json.dumps(stamp()))
+              with (dest/'perf-record.log').open('w') as plog:
+                  try:
+                      recorder = subprocess.Popen(['sudo','-n',perf,'record','-a','--clockid','mono','-m','2048','-o',str(dest/'perf.data'),*EVENTS,'--','sleep','120'],stdout=plog,stderr=subprocess.STDOUT,start_new_session=True)
+                      time.sleep(0.5)
+                      if recorder.poll() is not None: raise RuntimeError('Recorder stopped before navigation; no retry')
+                      observer.start()
+                      with (dest/'lighthouse.log').open('w') as lhlog:
+                          run(['./node_modules/.bin/lighthouse','https://remont-holodilnikov.kz/remont-xolodilnikov-na-domu-v-g-almaty','--config-path=./config.json','--chrome-flags=--headless','--output=json','--output-path='+str(dest/'report.json'),'--save-assets','--no-enable-error-reporting'],stdout=lhlog,stderr=subprocess.STDOUT,timeout=90)
+                  finally:
+                      stop.set()
+                      if observer.ident: observer.join(timeout=10)
+                      if recorder is not None and recorder.poll() is None:
+                          subprocess.run(['sudo','-n','kill','-INT','--','-'+str(recorder.pid)],check=False)
+                          try: recorder.wait(timeout=10)
+                          except subprocess.TimeoutExpired:
+                              subprocess.run(['sudo','-n','kill','-TERM','--','-'+str(recorder.pid)],check=False)
+                              recorder.wait(timeout=10)
+                      (dest/'clock-after.json').write_text(json.dumps(stamp()))
+              with (dest/'scheduler.txt').open('w') as f:
+                  run(['sudo','-n',perf,'script','--ns','-i',str(dest/'perf.data')],stdout=f,stderr=subprocess.STDOUT,timeout=45)
+              with (dest/'perf-header.txt').open('w') as f:
+                  run(['sudo','-n',perf,'report','--header-only','--stdio','-i',str(dest/'perf.data')],stdout=f,stderr=subprocess.STDOUT,timeout=20)
+              run(['sudo','-n','chown',str(os.getuid())+':'+str(os.getgid()),str(dest/'perf.data')])
+              print('Navigation '+index+' and raw scheduler recording saved',flush=True)
+          CAPTURE
+          cp capture.py results/capture.py
+          python3 capture.py
+      - name: Check files and event coverage without loading the site
+        if: always() && steps.navigation.outcome == 'success'
+        shell: bash
+        run: |
+          cat > validate.py <<'VALIDATOR'
+          """Validate saved artifacts; never opens the site or launches a browser."""
+          import collections
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import shutil
+          
+          import sys
+          out = pathlib.Path(sys.argv[1])
+          reports = list(out.glob('report.json'))
+          traces = list(out.glob('*.trace.json'))
+          logs = list(out.glob('*.devtoolslog.json'))
+          if len(reports) != 1 or len(traces) != 1 or len(logs) != 1:
+              raise SystemExit('Expected exactly one report, trace, and devtoolslog; no rerun will occur.')
+          shutil.copyfile(traces[0], out/'trace.json')
+          shutil.copyfile(logs[0], out/'devtoolslog.json')
+          report = json.loads(reports[0].read_text())
+          trace = json.loads((out/'trace.json').read_text())
+          log = json.loads((out/'devtoolslog.json').read_text())
+          events = trace['traceEvents']
+          names = collections.Counter(e.get('name','') for e in events)
+          methods = collections.Counter(e.get('method','') for e in log)
+          patterns = {
+              'lcp_candidate': r'largestContentfulPaint::Candidate|LargestContentfulPaint::Candidate',
+              'run_task': r'RunTask|ThreadControllerImpl::RunTask|ThreadPool_RunTask',
+              'js_sampling': r'^Profile$|^ProfileChunk$|^CpuProfile$',
+              'resource_send': r'^ResourceSendRequest$',
+              'resource_response': r'^ResourceReceiveResponse$',
+              'resource_finish': r'^ResourceFinish$',
+              'style': r'UpdateLayoutTree|RecalculateStyles|RecalcStyle',
+              'layout': r'^Layout$',
+              'paint': r'^Paint$',
+              'begin_frame': r'BeginFrame|BeginMainFrame',
+              'raster': r'RasterTask|RasterBuffer|Rasterize',
+              'commit': r'Commit|commit',
+              'activation': r'ActivateLayerTree|Activation|ActivateSyncTree',
+              'presentation': r'Presentation|Presented|SwapBuffers|Display::DrawAndSwap',
+          }
+          groups = {k:{n:c for n,c in names.items() if re.search(p,n)} for k,p in patterns.items()}
+          metrics = report.get('audits',{}).get('metrics',{}).get('details',{}).get('items',[{}])[0]
+          nav_ts = metrics.get('observedNavigationStartTs')
+          navs = [e for e in events if e.get('name') == 'navigationStart']
+          matching_navs = [e for e in navs if nav_ts is not None and abs(e['ts']-nav_ts) <= 1000]
+          documents = [e.get('params',{}) for e in log if e.get('method') == 'Network.requestWillBeSent' and e.get('params',{}).get('type') == 'Document']
+          target_documents = [e for e in documents if e.get('request',{}).get('url') == report.get('requestedUrl')]
+          samples = sum(len(e.get('args',{}).get('data',{}).get('cpuProfile',{}).get('samples',[])) for e in events if e.get('name') == 'ProfileChunk')
+          thread_names = [{'pid':e.get('pid'),'tid':e.get('tid'),'name':e.get('args',{}).get('name')} for e in events if e.get('name') == 'thread_name']
+          core = ['lcp_candidate','run_task','js_sampling','resource_send','resource_response','resource_finish','layout','paint']
+          checks = {
+              'lighthouse_13_5_0': report.get('lighthouseVersion') == '13.5.0',
+              'one_target_document_request': len(target_documents) == 1,
+              'report_navigation_timestamp_found_in_trace': bool(matching_navs),
+              'devtools_has_network_response': methods['Network.responseReceived'] > 0,
+              'devtools_has_network_finish': methods['Network.loadingFinished'] > 0,
+              'nonempty_js_samples': samples > 0,
+              **{k:bool(groups[k]) for k in core},
+          }
+          hashes = {n:hashlib.sha256((out/n).read_bytes()).hexdigest() for n in ['report.json','trace.json','devtoolslog.json']}
+          result = {'checks':checks,'core_pass':all(checks.values()),'event_groups':groups,
+              'profile_samples':samples,'trace_events':len(events),'cdp_methods':dict(methods),
+              'matching_navigation_events':matching_navs,'document_requests':documents,
+              'thread_names':thread_names,'metrics':metrics,'environment':report.get('environment'),
+              'configSettings':report.get('configSettings'),'fetchTime':report.get('fetchTime'),
+              'runWarnings':report.get('runWarnings'),'runtimeError':report.get('runtimeError'),
+              'sha256':hashes,
+              'limitations':'Event-name presence alone does not prove a full frame flow or actual hardware display presentation. Inspect pid/tid, flow IDs, timings and sample stacks. This is a headless Linux VM.'}
+          (out/'validation.json').write_text(json.dumps(result,indent=2))
+          (out/'event-counts.json').write_text(json.dumps(dict(names),indent=2))
+          lines=['# Single-navigation pilot artifact check','',f"Core checks pass: {result['core_pass']}",'', '| Event group | Events |','|---|---:|']
+          lines += [f'| {k} | {sum(v.values())} |' for k,v in groups.items()]
+          lines += ['',f'JS samples: {samples}',f'Trace events: {len(events)}','',result['limitations']]
+          (out/'validation.md').write_text('\n'.join(lines))
+          print('\n'.join(lines))
+          print('METRICS', json.dumps(metrics))
+          print('LCP', json.dumps(report.get('audits',{}).get('lcp-breakdown-insight',{}).get('details',{})))
+          if not result['core_pass']:
+              raise SystemExit('Required artifact checks failed. Do not start a series.')
+          VALIDATOR
+          python3 validate.py results/run-01
+          python3 validate.py results/run-02
+      - name: Preserve both navigations
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-scheduler-${{ github.run_id }}
+          path: results/
+          retention-days: 14
+          compression-level: 9
+          if-no-files-found: error
