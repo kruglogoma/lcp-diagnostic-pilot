@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: official-psi-api
   cancel-in-progress: false
@@ -12,6 +13,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 38
     steps:
+      - name: Reuse previously saved PSI responses
+        uses: actions/download-artifact@v4
+        with:
+          name: psi-api-pair-40333771886
+          run-id: 40333771886
+          github-token: ${{ github.token }}
+          path: seed
       - name: Official PSI sequential requests until pair
         shell: bash
         env:
@@ -30,9 +38,22 @@ jobs:
           if not key: raise SystemExit('PSI_API_KEY missing; no request sent')
           endpoint='https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed'
           url=endpoint+'?'+urllib.parse.urlencode(dict(params,key=key))
-          groups={}; summaries=[]; selected=None; reason='maximum_10_requests'
+          groups={}; summaries=[]; selected=None; reason='maximum_10_total_requests'
+          import shutil
+          seed=pathlib.Path('seed')
+          if seed.exists(): shutil.copytree(seed,root/'previous',dirs_exist_ok=True)
+          for old in sorted(seed.glob('run-*/lighthouse-report.json')):
+              lhr=json.loads(old.read_text()); number=old.parent.name
+              signature={'lighthouseVersion':lhr.get('lighthouseVersion'),'userAgent':lhr.get('userAgent'),'configSettings':lhr.get('configSettings'),'finalDisplayedUrl':lhr.get('finalDisplayedUrl'),'finalUrl':lhr.get('finalUrl')}
+              sig=hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()
+              lcp=lhr.get('audits',{}).get('largest-contentful-paint',{}).get('numericValue')
+              group=groups.setdefault(sig,{})
+              if isinstance(lcp,(int,float)) and lcp<=2500:
+                  if 'fast' not in group or lcp<group['fast'][1]['audits']['largest-contentful-paint']['numericValue']: group['fast']=(number,lhr)
+              oldsummary=old.parent/'summary.json'
+              if oldsummary.exists(): summaries.append(json.loads(oldsummary.read_text()))
           def save(path,obj): path.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
-          for number in range(1,11):
+          for number in range(7,11):
               out=root/f'run-{number:02d}'; out.mkdir()
               start=datetime.datetime.now(datetime.timezone.utc).isoformat(); clock=time.monotonic()
               meta={'parameters':params,'endpoint':endpoint,'started_utc':start,'api_key_used':True,'request_number':number}
@@ -56,7 +77,8 @@ jobs:
               row={'run':number,'started_utc':start,'fetchTime':lhr.get('fetchTime'),'http_status':status,'runtimeError':lhr.get('runtimeError'),'error':data.get('error'),'score':lhr.get('categories',{}).get('performance',{}).get('score'),'values':values,'metrics':metrics,'signature':sig,'environment':lhr.get('environment'),'runWarnings':lhr.get('runWarnings')}
               save(out/'summary.json',row); summaries.append(row); save(root/'series-summary.json',summaries)
               if lhr: save(out/'lighthouse-report.json',lhr)
-              print('RUN_SUMMARY '+json.dumps(row,ensure_ascii=True),flush=True)
+              print('RUN_SUMMARY '+json.dumps({k:v for k,v in row.items() if k not in ['metrics','environment','error','runWarnings']},ensure_ascii=True),flush=True)
+              print('OBSERVED '+json.dumps({k:v for k,v in metrics.items() if k in ['observedFirstContentfulPaint','observedLargestContentfulPaint','observedDomContentLoaded','observedLoad','observedFirstVisualChange','observedNavigationStartTs']},ensure_ascii=True),flush=True)
               if status!=200 or not lhr or lhr.get('runtimeError'):
                   reason='api_or_measurement_error'; break
               lcp=values['largest-contentful-paint']; group=groups.setdefault(sig,{})
@@ -65,7 +87,7 @@ jobs:
                   if lcp>=5000 and 'slow' not in group: group['slow']=(number,lhr)
               if 'fast' in group and 'slow' in group:
                   selected=group; reason='comparable_pair_found'; break
-              if number<10: time.sleep(20)
+              if number<10: time.sleep(90)
           save(root/'stop.json',{'reason':reason,'requests':len(summaries),'thresholds_ms':{'fast_max':2500,'slow_min':5000},'pair':{k:v[0] for k,v in selected.items()} if selected else None})
           print('STOP '+json.dumps(json.loads((root/'stop.json').read_text())),flush=True)
           if selected:
@@ -77,7 +99,8 @@ jobs:
               for label,item in comparison.items():
                   print('PAIR_META '+json.dumps({k:v for k,v in item.items() if k!='audits'}),flush=True)
                   for name,audit in item['audits'].items():
-                      print('PAIR_AUDIT '+label+' '+name+' '+json.dumps(audit,ensure_ascii=True,separators=(',',':')),flush=True)
+                      payload=json.dumps(audit,ensure_ascii=True,separators=(',',':'))
+                      for offset in range(0,len(payload),700): print('AUDIT_CHUNK '+label+' '+name+' '+str(offset)+' '+payload[offset:offset+700],flush=True)
           PYTHON
           cp series.py results/series.py
           python3 series.py
