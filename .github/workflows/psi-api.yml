@@ -1,0 +1,59 @@
+name: Official PSI API single pilot
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: official-psi-api
+  cancel-in-progress: false
+jobs:
+  psi:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: One official PSI API request
+        shell: bash
+        run: |
+          mkdir -p results
+          cat > pilot.py <<'PYTHON'
+          """One official PSI API request, no local browser or Lighthouse execution."""
+          import urllib.request, urllib.parse, urllib.error
+          import json, pathlib, datetime, time, hashlib
+          
+          out=pathlib.Path('results'); out.mkdir(exist_ok=True)
+          target='https://remont-holodilnikov.kz/remont-xolodilnikov-na-domu-v-g-almaty'
+          params={'url':target,'strategy':'mobile','category':'performance','locale':'en-US'}
+          url='https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed?'+urllib.parse.urlencode(params)
+          start=datetime.datetime.now(datetime.timezone.utc).isoformat(); clock=time.monotonic()
+          meta={'target':target,'parameters':params,'endpoint':'https://pagespeedonline.googleapis.com/pagespeedonline/v5/runPagespeed','started_utc':start,'api_key_used':False,'request_count':1}
+          body=b''; status=None
+          try:
+              with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'PSI-diagnostic-pilot/1.0','Accept':'application/json'}),timeout=180) as response:
+                  status=response.status; body=response.read(); meta['response_headers']=dict(response.headers)
+          except urllib.error.HTTPError as error:
+              status=error.code; body=error.read(); meta['response_headers']=dict(error.headers)
+          except Exception as error:
+              meta['transport_error']=type(error).__name__
+          meta.update({'http_status':status,'elapsed_seconds':time.monotonic()-clock,'body_sha256':hashlib.sha256(body).hexdigest(),'body_bytes':len(body)})
+          (out/'response.json').write_bytes(body)
+          try: response=json.loads(body)
+          except Exception: response={}
+          lhr=response.get('lighthouseResult',{}); audits=lhr.get('audits',{}); metrics=audits.get('metrics',{}).get('details',{}).get('items',[{}])[0]
+          summary={'http_status':status,'fetchTime':lhr.get('fetchTime'),'lighthouseVersion':lhr.get('lighthouseVersion'),'runtimeError':lhr.get('runtimeError'),'error':response.get('error'),'score':lhr.get('categories',{}).get('performance',{}).get('score'),'lcp_ms':audits.get('largest-contentful-paint',{}).get('numericValue'),'observed_lcp_ms':metrics.get('observedLargestContentfulPaint'),'observed_fcp_ms':metrics.get('observedFirstContentfulPaint'),'available_audits':sorted(audits),'has_raw_trace': 'traceEvents' in response or 'traceEvents' in lhr,'has_devtools_log': 'devtoolsLog' in response or 'devtoolsLog' in lhr}
+          (out/'request-metadata.json').write_text(json.dumps(meta,indent=2))
+          (out/'summary.json').write_text(json.dumps(summary,indent=2))
+          if lhr: (out/'lighthouse-report.json').write_text(json.dumps(lhr))
+          print(json.dumps(summary,indent=2),flush=True)
+          print('Exactly one API request; no retry, no local Lighthouse.',flush=True)
+          PYTHON
+          cp pilot.py results/pilot.py
+          python3 pilot.py
+      - name: Save full PSI response including errors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psi-api-pilot-${{ github.run_id }}
+          path: results/
+          retention-days: 14
+          if-no-files-found: error
