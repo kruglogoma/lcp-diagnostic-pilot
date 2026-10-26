@@ -15,7 +15,7 @@ jobs:
       - name: One official PSI API request
         shell: bash
         env:
-          PSI_API_KEY: ${{ secrets.PCI_API_KEY }}
+          PSI_API_KEY: ${{ secrets.PSI_API_KEY }}
         run: |
           mkdir -p results
           cat > pilot.py <<'PYTHON'
