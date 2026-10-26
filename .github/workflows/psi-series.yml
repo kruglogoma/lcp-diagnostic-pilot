@@ -81,6 +81,8 @@ jobs:
               print('OBSERVED '+json.dumps({k:v for k,v in metrics.items() if k in ['observedFirstContentfulPaint','observedLargestContentfulPaint','observedDomContentLoaded','observedLoad','observedFirstVisualChange','observedNavigationStartTs']},ensure_ascii=True),flush=True)
               if status!=200 or not lhr or lhr.get('runtimeError'):
                   reason='api_or_measurement_error'; break
+              if any(previous.get('fetchTime')==row.get('fetchTime') for previous in summaries[:-1]):
+                  reason='duplicate_report_no_more_requests'; break
               lcp=values['largest-contentful-paint']; group=groups.setdefault(sig,{})
               if isinstance(lcp,(int,float)):
                   if lcp<=2500 and 'fast' not in group: group['fast']=(number,lhr)
