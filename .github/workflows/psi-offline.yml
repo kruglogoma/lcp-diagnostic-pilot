@@ -11,8 +11,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: psi-api-pair-40381049934
-          run-id: 40381049934
+          name: psi-spaced-40482543668
+          run-id: 40482543668
           github-token: ${{ github.token }}
           path: seed
       - name: Analyze existing JSON only - no PSI requests
