@@ -1,0 +1,49 @@
+name: Offline analysis saved PSI reports
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  analysis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: psi-api-pair-40381049934
+          run-id: 40381049934
+          github-token: ${{ github.token }}
+          path: seed
+      - name: Analyze existing JSON only - no PSI requests
+        run: |
+          cat > analyze.py <<'PYTHON'
+          import json,pathlib,hashlib
+          root=pathlib.Path('seed'); out=pathlib.Path('analysis');out.mkdir(exist_ok=True)
+          seen=set(); rows=[]; duplicates=[]
+          names=['lcp-breakdown-insight','lcp-discovery-insight','document-latency-insight','render-blocking-insight','network-dependency-tree-insight','font-display-insight','bootup-time','third-parties-insight','mainthread-work-breakdown','main-thread-tasks','long-tasks','resource-summary','diagnostics']
+          for path in sorted(root.rglob('lighthouse-report.json')):
+              lhr=json.loads(path.read_text()); stamp=lhr['fetchTime']
+              if stamp in seen: duplicates.append(str(path));continue
+              seen.add(stamp); a=lhr['audits']; m=a['metrics']['details']['items'][0]
+              requests=a.get('network-requests',{}).get('details',{}).get('items',[])
+              row={'path':str(path),'fetchTime':stamp,'lighthouseVersion':lhr.get('lighthouseVersion'),'environment':lhr.get('environment'),'configSettings':lhr.get('configSettings'),'warnings':lhr.get('runWarnings'),'metrics':m,'audits':{k:a.get(k) for k in names},'requests':requests}
+              rows.append(row)
+          rows.sort(key=lambda r:r['fetchTime'])
+          result={'independent':len(rows),'duplicates':duplicates,'rows':rows}
+          (out/'analysis.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
+          print('INDEPENDENT',len(rows),'DUPLICATES',len(duplicates),flush=True)
+          for r in rows:
+              print('RUN',r['path'],r['fetchTime'],flush=True)
+              # Short complete lines permit retrieval even while the Actions log is streaming.
+              payload=json.dumps(r,ensure_ascii=True,separators=(',',':'))
+              print('ROW_SHA256',hashlib.sha256(payload.encode()).hexdigest(),flush=True)
+              for offset in range(0,len(payload),700): print('DATA',offset,payload[offset:offset+700],flush=True)
+              print('END_RUN',flush=True)
+          PYTHON
+          python3 analyze.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: psi-offline-analysis-${{ github.run_id }}
+          path: analysis/
+          retention-days: 14
